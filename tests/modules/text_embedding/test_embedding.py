@@ -1,7 +1,9 @@
 """Tests for text embedding module"""
 
 # Standard
+from pathlib import Path
 from typing import List, Tuple
+import importlib
 import os
 import tempfile
 
@@ -477,6 +479,19 @@ def test__get_ipex(use_ipex):
     Assumes that when running tests, we won't have IPEX installed.
     """
     assert not EmbeddingModule._get_ipex(use_ipex)
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("openvino") is not None, reason="OpenVINO is installed."
+)
+@pytest.mark.parametrize(
+    "use_openvino",
+    [None, "true", "True", "False", "false"],
+)
+def test__get_openvino(use_openvino):
+    """Test that when OpenVINO is not installed, _get_openvino returns False instead of raising an exception."""
+    if importlib.util.find_spec("openvino") is None:
+        assert not EmbeddingModule._get_openvino(use_openvino)
 
 
 def test__optimize():
@@ -1094,3 +1109,45 @@ def test_same_same(loaded_model: EmbeddingModule, truncate_input_tokens):
     assert not np.array_equal(combined_vectors[1], combined_vectors[2])
     assert np.array_equal(separate_vectors[0], separate_vectors[1])
     assert not np.array_equal(separate_vectors[1], separate_vectors[2])
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("openvino") is None, reason="OpenVINO is not installed."
+)
+def test_openvino(loaded_model):
+    """
+    Test that OpenVINO integration works and returns the same embeddings as PyTorch
+    Run `pip install optimum[openvino]` to install dependencies for using OpenVINO)
+    """
+    # Third Party
+    from optimum.intel import OVModelForFeatureExtraction
+
+    # Local
+    import caikit_nlp.modules.text_embedding.embedding
+
+    openvino = caikit_nlp.modules.text_embedding.embedding.OPENVINO
+    openvino_config = caikit_nlp.modules.text_embedding.embedding.OPENVINO_CONFIG
+    caikit_nlp.modules.text_embedding.embedding.OPENVINO = True
+    caikit_nlp.modules.text_embedding.embedding.OPENVINO_CONFIG = {
+        "INFERENCE_PRECISION_HINT": "f32"
+    }
+
+    try:
+        with tempfile.TemporaryDirectory() as model_dir:
+            ov_model_dir = Path(model_dir) / "ov_model"
+            BOOTSTRAPPED_MODEL.save(str(ov_model_dir))
+            ov_model = caikit_nlp.modules.text_embedding.EmbeddingModule.load(
+                str(ov_model_dir)
+            )
+            assert isinstance(
+                ov_model.model._first_module().auto_model, OVModelForFeatureExtraction
+            )
+    finally:
+        caikit_nlp.modules.text_embedding.embedding.OPENVINO = openvino
+        caikit_nlp.modules.text_embedding.embedding.OPENVINO_CONFIG = openvino_config
+
+    pt_embeddings = loaded_model.run_embedding(text="hello world")
+    ov_embeddings = ov_model.run_embedding(text="hello world")
+    assert np.allclose(
+        pt_embeddings.result.data.values, ov_embeddings.result.data.values
+    )

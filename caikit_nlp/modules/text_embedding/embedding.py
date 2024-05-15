@@ -84,6 +84,8 @@ embedding_cfg = get_config().get("embedding", {})
 
 AUTOCAST = env_val_to_bool(val=embedding_cfg.get("autocast"))
 IPEX = env_val_to_bool(val=embedding_cfg.get("ipex"))
+OPENVINO = env_val_to_bool(val=embedding_cfg.get("openvino"))
+OPENVINO_CONFIG = embedding_cfg.get("openvino_config", None)
 PT2_COMPILE = env_val_to_bool(val=embedding_cfg.get("pt2_compile"))
 RETRIES = env_val_to_int(val=embedding_cfg.get("retries"), default=0)
 BATCH_SIZE = env_val_to_int(val=embedding_cfg.get("batch_size"), default=0)
@@ -162,14 +164,27 @@ class EmbeddingModule(ModuleBase):
         error.dir_check("<NLP34197772E>", artifacts_path)
 
         ipex = cls._get_ipex(IPEX)
+        openvino = cls._get_openvino(OPENVINO)
         device = cls._select_device(ipex, DEVICE)
+        model_kwargs = (
+            {"ov_config": OPENVINO_CONFIG}
+            if (openvino and OPENVINO_CONFIG is not None)
+            else None
+        )
         model = SentenceTransformerWithTruncate(
-            model_name_or_path=artifacts_path, device=device
+            model_name_or_path=artifacts_path,
+            device=device,
+            backend="openvino" if openvino else None,
+            model_kwargs=model_kwargs,
         )
         model.eval()  # required for IPEX at least
         if device is not None:
             model.to(torch.device(device))
-        model = EmbeddingModule._optimize(model, ipex, device, AUTOCAST, PT2_COMPILE)
+
+        if not openvino:
+            model = EmbeddingModule._optimize(
+                model, ipex, device, AUTOCAST, PT2_COMPILE
+            )
 
         # Validate model with any encode test (simple and hardcoded for now).
         # This gets some of the first-time inference cost out of the way.
@@ -196,6 +211,29 @@ class EmbeddingModule(ModuleBase):
                 msg = (
                     f"IPEX enabled in env, but skipping ipex.optimize() because "
                     f"import intel_extension_for_pytorch failed with exception: {ie}"
+                )
+                logger.warning(msg, exc_info=True)
+
+        return ret
+
+    @classmethod
+    def _get_openvino(cls, openvino_flag):
+        """Get OpenVINO optimization library if enabled and available, else return False
+
+        Returns openvino library or False
+        """
+        ret = False
+
+        # Enabled by environment variable
+        # When IPEX is not false, attempt to import the library and use it.
+        if openvino_flag:
+            try:
+                ret = importlib.import_module("openvino")
+            except Exception as ie:  # pylint: disable=broad-exception-caught
+                # We don't require the module so catch, log, proceed to return False
+                msg = (
+                    f"OpenVINO enabled in env, but OpenVINO will not be used because "
+                    f"import openvino failed with exception: {ie}"
                 )
                 logger.warning(msg, exc_info=True)
 
@@ -833,7 +871,7 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
         tokenized = self.tokenizer(
             *to_tokenize,
             return_attention_mask=True,
-            return_token_type_ids=False,
+            return_token_type_ids=self._backend == "openvino",
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
             return_length=True,
@@ -852,7 +890,7 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
             tokenized = self.tokenizer(
                 *to_tokenize,
                 return_attention_mask=True,
-                return_token_type_ids=False,
+                return_token_type_ids=self._backend == "openvino",
                 return_overflowing_tokens=True,
                 return_offsets_mapping=True,
                 return_length=True,
@@ -878,7 +916,7 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
         tokenized = self.tokenizer(
             *to_tokenize,
             return_attention_mask=True,
-            return_token_type_ids=False,
+            return_token_type_ids=self._backend == "openvino",
             return_overflowing_tokens=False,
             return_offsets_mapping=False,
             return_length=False,
