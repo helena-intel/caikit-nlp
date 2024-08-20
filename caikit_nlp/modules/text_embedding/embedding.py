@@ -14,13 +14,27 @@
 
 # Standard
 from collections.abc import Sized
+from copy import deepcopy
 from enum import Enum, auto
-from typing import Callable, Dict, List, NamedTuple, Optional, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    TypeVar,
+    Union,
+)
 import importlib
 import os
+import threading
 import time
 
 # Third Party
+from torch import nn
 from torch.backends import mps
 from transformers import BatchEncoding
 import numpy as np
@@ -42,6 +56,8 @@ from caikit.interfaces.nlp.data_model import (
     SentenceSimilarityResult,
     SentenceSimilarityResults,
     SentenceSimilarityScores,
+    Token,
+    TokenizationResults,
 )
 from caikit.interfaces.nlp.tasks import (
     EmbeddingTask,
@@ -50,6 +66,7 @@ from caikit.interfaces.nlp.tasks import (
     RerankTasks,
     SentenceSimilarityTask,
     SentenceSimilarityTasks,
+    TokenizationTask,
 )
 import alog
 
@@ -66,6 +83,8 @@ try:
     sentence_transformers = importlib.import_module("sentence_transformers")
     # Third Party
     from sentence_transformers import SentenceTransformer
+    from sentence_transformers.model_card import SentenceTransformerModelCardData
+    from sentence_transformers.similarity_functions import SimilarityFunction
     from sentence_transformers.util import batch_to_device, cos_sim, dot_score
     from sentence_transformers.util import (
         normalize_embeddings as normalize,  # avoid parameter shadowing
@@ -93,6 +112,7 @@ NO_IMPLICIT_TRUNCATION = env_val_to_bool(
     val=embedding_cfg.get("implicit_truncation_errors", True)
 )
 DEVICE = embedding_cfg.get("device", "")
+TRUST_REMOTE_CODE = embedding_cfg.get("trust_remote_code")
 
 RT = TypeVar("RT")  # return type
 
@@ -109,8 +129,10 @@ class TruncatedTokensTuple(NamedTuple):
 
     tokenized: BatchEncoding
     input_token_count: int
+    truncation_needed: List[int]
 
 
+# pylint: disable=too-many-lines
 @module(
     "eeb12558-b4fa-4f34-a9fd-3f5890e9cd3f",
     "EmbeddingModule",
@@ -122,6 +144,7 @@ class TruncatedTokensTuple(NamedTuple):
         SentenceSimilarityTasks,
         RerankTask,
         RerankTasks,
+        TokenizationTask,
     ],
 )
 class EmbeddingModule(ModuleBase):
@@ -176,22 +199,52 @@ class EmbeddingModule(ModuleBase):
             device=device,
             backend="openvino" if openvino else None,
             model_kwargs=model_kwargs,
+            trust_remote_code=TRUST_REMOTE_CODE,
         )
         model.eval()  # required for IPEX at least
         if device is not None:
             model.to(torch.device(device))
 
         if not openvino:
-            model = EmbeddingModule._optimize(
-                model, ipex, device, AUTOCAST, PT2_COMPILE
-            )
-
-        # Validate model with any encode test (simple and hardcoded for now).
-        # This gets some of the first-time inference cost out of the way.
-        # This avoids using the tokenizer (for truncation) before it is ready.
-        model.encode("warmup")
-
+            model = EmbeddingModule._optimize(model, ipex, device, AUTOCAST, PT2_COMPILE)
         return cls(model)
+
+    @property
+    def public_model_info(cls) -> Dict[str, Any]:  # pylint: disable=no-self-argument
+        """Helper property to return public metadata about a specific Model. This
+        function is separate from `metdata` as that contains the entire ModelConfig
+        which might not want to be shared/exposed.
+
+        Returns:
+            Dict[str, str]: A dictionary of this models's public metadata
+        """
+        return {
+            "max_seq_length": cls.model.max_seq_length,
+            "sentence_embedding_dimension": cls.model.get_sentence_embedding_dimension(),
+        }
+
+    @TokenizationTask.taskmethod()
+    def run_tokenizer(
+        self,
+        text: str,
+    ) -> TokenizationResults:
+        """Run tokenization task against the model
+
+        Args:
+            text: str
+                Text to tokenize
+        Returns:
+            TokenizationResults
+                The token count
+        """
+        result = self.model._get_tokenized([text])
+
+        mapping = [
+            interv for interv in result.offset_mapping[0] if (interv[1] - interv[0]) > 0
+        ]
+        tokens = [Token(start=i[0], end=i[1], text=text[i[0] : i[1]]) for i in mapping]
+
+        return TokenizationResults(token_count=len(result.input_ids[0]), results=tokens)
 
     @classmethod
     def _get_ipex(cls, ipex_flag):
@@ -707,7 +760,12 @@ class EmbeddingModule(ModuleBase):
             model_name_or_path: str
                 Model name (Hugging Face hub) or path to model to load.
         """
-        return cls(model=SentenceTransformer(model_name_or_path=model_name_or_path))
+        return cls(
+            model=SentenceTransformer(
+                model_name_or_path=model_name_or_path,
+                trust_remote_code=TRUST_REMOTE_CODE,
+            )
+        )
 
     def save(self, model_path: str, *args, **kwargs):
         """Save model using config in model_path
@@ -775,12 +833,10 @@ class TruncateCountBehavior(Enum):
 
 def sum_token_count(
     tokenized: BatchEncoding,
-    truncate_only: bool,
 ) -> int:
-    """Returns the number of non-special tokens.
+    """Returns the number of non-special tokens. Assumes truncation w/o overflow.
     Args:
         tokenized: BatchEncoding
-        truncate_only: bool
     Returns:
         Int total of all tokens contained in tokenized.
     """
@@ -805,33 +861,140 @@ def sum_token_count(
 
     token_count = 0
 
-    if truncate_only:
-        # Only sum the length for the 1st encoding of each sample
-        samples_start_idx = get_sample_start_indexes(tokenized)
-
-        token_count = sum(
-            (
-                x
-                for idx in samples_start_idx
-                for x in tokenized.encodings[idx].attention_mask
-            )
-        )
-    else:
-        # Sum the length of all encodings for all samples
-        for encoding in tokenized.encodings:
-            token_count += sum(encoding.attention_mask)
+    # Sum the length of all encodings for all samples
+    for encoding in tokenized.encodings:
+        token_count += sum(encoding.attention_mask)
 
     return token_count
 
 
+def _truncate_texts(texts, tokenized, max_length, text_indexes):
+    """Truncate texts using tokenized offsets and desired max_length.
+
+    This implements truncation in the texts without changing the tokenizer
+    truncation parameters to avoid thread locking ("Already borrowed" exceptions).
+
+    After the texts have been truncated, they should be re-tokenized
+    to get a new `tokenized` structure for use in encode.
+    """
+
+    for text_number in text_indexes:
+
+        # The offset_mapping describes the text position for each token in this text.
+        offsets = tokenized["offset_mapping"][text_number]
+
+        # Find the first offset that is not empty (0, 0) to avoid added tokens
+        # Note: Normally just start at 0, but it's imaginable that tokenizer could skip stuff.
+        start = next(offset for offset in offsets if offset != (0, 0))[0]
+        # Find the end index where the text string should be truncated
+        end = _get_end_index(max_length, text_number, tokenized)
+
+        # Use the start-beginning end-ending to slice the text based on token truncation
+        # i.e. if start=(0,5) and end=(72,78) then we want slice [0:78]
+        texts[text_number] = texts[text_number][
+            start:end
+        ]  # replace text with truncated
+
+
+def _get_end_index(max_length, text_number, tokenized):
+    offsets = tokenized["offset_mapping"][text_number]
+    attn_mask = tokenized.encodings[text_number].attention_mask
+
+    # Find the last offset by counting attn masks
+    # and keeping the last non-zero offset end.
+    token_count = 0
+    end_index = 0
+    for n, attn in enumerate(attn_mask):
+        if attn == 1:
+            token_count += 1
+            end = offsets[n][1]  # Index to end character from offset
+            if end > end_index:  # Grab last non-zero end index (ensures increasing too)
+                end_index = end
+        if token_count >= max_length - 1:  # Stop with room for an end token
+            break
+    return end_index
+
+
 class SentenceTransformerWithTruncate(SentenceTransformer):
-    def _truncate_input_tokens(
+    def __init__(
+        self,
+        model_name_or_path: Optional[str] = None,
+        modules: Optional[Iterable[nn.Module]] = None,
+        device: Optional[str] = None,
+        prompts: Optional[Dict[str, str]] = None,
+        default_prompt_name: Optional[str] = None,
+        similarity_fn_name: Optional[Union[str, SimilarityFunction]] = None,
+        cache_folder: Optional[str] = None,
+        trust_remote_code: bool = False,
+        revision: Optional[str] = None,
+        local_files_only: bool = False,
+        token: Optional[Union[bool, str]] = None,
+        use_auth_token: Optional[Union[bool, str]] = None,
+        truncate_dim: Optional[int] = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+        config_kwargs: Optional[Dict[str, Any]] = None,
+        model_card_data: Optional[SentenceTransformerModelCardData] = None,
+        backend: Optional[str] = None
+    ):
+        super().__init__(
+            model_name_or_path,
+            modules,
+            device,
+            prompts,
+            default_prompt_name,
+            similarity_fn_name,
+            cache_folder,
+            trust_remote_code,
+            revision,
+            local_files_only,
+            token,
+            use_auth_token,
+            truncate_dim,
+            model_kwargs,
+            tokenizer_kwargs,
+            config_kwargs,
+            model_card_data,
+            backend
+        )
+        self.tokenizers = {}
+
+    def _truncation_needed(self, tokenized, max_length, texts):
+        """Check for truncation needed to meet max_length token limit
+        Returns:
+            List of indexes of the texts that need truncating ([] if none)
+        """
+
+        ret = []  # List of indexes for texts that need truncation
+
+        if max_length < 0:
+            # -1 means to just let the model do its thing
+            return ret
+
+        for i, encoding in enumerate(tokenized.encodings):
+            input_tokens = sum(encoding.attention_mask)
+            if input_tokens > max_length or input_tokens > self.max_seq_length:
+                # Greater than truncate_input_tokens plus 2 (start/end) or over model limit
+                ret.append(i)
+            elif input_tokens == self.max_seq_length:
+                # At model limit, including start/end...
+                # This may or may not have already been truncated at the model limit.
+                # Check the strlen and last offset to see if the text actually needs truncating
+                # to make room for the end separator token.
+                # We need to know this, for "not okay_to_truncate" errors.
+                end_index = _get_end_index(max_length, i, tokenized)
+                if end_index < len(texts[i]):
+                    ret.append(i)
+
+        return ret
+
+    def _tokenize_plus(
         self,
         truncate_input_tokens: int,
         texts: List[str],
         implicit_truncation_errors: bool = True,
     ) -> TruncatedTokensTuple:
-        """Truncate input tokens
+        """Tokenize with support for truncation handling and returning the token count
         Args:
             truncate_input_tokens: int
                 Truncation length for input tokens.
@@ -866,74 +1029,63 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
         assert len(texts) > 0, "Cannot truncate nothing"
         assert isinstance(texts[0], str), "Only str can be truncated"
 
-        to_tokenize = [texts]
-        to_tokenize = [[str(s).strip() for s in col] for col in to_tokenize]
-        tokenized = self.tokenizer(
-            *to_tokenize,
-            return_attention_mask=True,
-            return_token_type_ids=self._backend == "openvino",
-            return_overflowing_tokens=True,
-            return_offsets_mapping=True,
-            return_length=True,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=max_length,
+        texts = [str(s).strip() for s in texts]
+
+        # Call tokenizer with the same truncation parameters every time
+        tokenized = self._get_tokenized(texts)
+
+        # Custom truncation and/or error raise if needed
+        truncation_needed = self._truncation_needed(tokenized, max_length, texts)
+        if truncation_needed and okay_to_truncate:
+            # Truncate texts in place
+            _truncate_texts(texts, tokenized, max_length, truncation_needed)
+            # Re-tokenize the truncated texts
+            tokenized = self._get_tokenized(texts)
+            truncation_needed = []  # truncation accomplished
+
+        input_token_count = sum_token_count(tokenized)
+        return TruncatedTokensTuple(tokenized, input_token_count, truncation_needed)
+
+    def _get_tokenized(self, texts):
+        """Intentionally always call tokenizer the same way to avoid thread issues.
+
+        Use a copy of the tokenizer per-model (self) and per-thread (map by thread ID).
+
+        Avoid changing the max length, truncation, and padding to avoid the
+        "Already borrowed" errors that come with concurrent threads attempting to use
+        the fast tokenizer with different truncation settings.
+        """
+
+        # Keep copies of tokenizer per thread (in each wrapped model instance)
+        thread_id = threading.get_ident()
+        tokenizer = (
+            self.tokenizers[thread_id]
+            if thread_id in self.tokenizers
+            else self.tokenizers.setdefault(thread_id, deepcopy(self.tokenizer))
         )
 
-        # When truncation occurs multiple encodings are created for a single sample text
-        was_truncated = len(tokenized.encodings) > len(to_tokenize[0])
-
-        if not okay_to_truncate and was_truncated:
-            # re-tokenize without truncation to eliminate the duplication of certain
-            # special tokens (eg. [CLS] and [SEP]) with each overflow encoding.
-            tokenized = self.tokenizer(
-                *to_tokenize,
-                return_attention_mask=True,
-                return_token_type_ids=self._backend == "openvino",
-                return_overflowing_tokens=True,
-                return_offsets_mapping=True,
-                return_length=True,
-                return_tensors="pt",
-                truncation=False,
-                padding=True,
-            )
-
-            tokens = 0
-            for encoding in tokenized.encodings:
-                tokens = max(sum(encoding.attention_mask), tokens)
-            error.log_raise(
-                "<NLP08391926E>",
-                ValueError(
-                    f"Token sequence length is longer than the specified "
-                    f"maximum sequence length for this model ({tokens} > {max_tokens})."
-                ),
-            )
-
-        input_token_count = sum_token_count(tokenized, truncate_only=True)
-
-        # Tokenize without overflow for batching and truncation to work together.
-        tokenized = self.tokenizer(
-            *to_tokenize,
-            return_attention_mask=True,
-            return_token_type_ids=self._backend == "openvino",
-            return_overflowing_tokens=False,
-            return_offsets_mapping=False,
+        return tokenizer(
+            texts,
+            return_attention_mask=True,  # Used for determining token count
+            return_token_type_ids=False,
+            return_overflowing_tokens=False,  # DO NOT USE overflow tokens break sentence batches
+            return_offsets_mapping=True,  # Used for truncation
             return_length=False,
             return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=max_length,
+            truncation=True,  # DO NOT CHANGE else "Already borrowed" errors
+            padding=True,  # DO NOT CHANGE else "Already borrowed" errors
+            max_length=self.max_seq_length,  # DO NOT CHANGE else "Already borrowed" errors
         )
-
-        return TruncatedTokensTuple(tokenized, input_token_count)
 
     def encode(
         self,
         sentences: Union[str, List[str]],
+        prompt_name: Optional[str] = None,
+        prompt: Optional[str] = None,
         batch_size: int = 32,
         show_progress_bar: bool = None,
         output_value: str = "sentence_embedding",
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = "float32",
         convert_to_numpy: bool = True,
         convert_to_tensor: bool = False,
         device: str = None,
@@ -946,9 +1098,12 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
         Computes sentence embeddings
 
         :param sentences: the sentences to embed
+        :param prompt_name: Ignored here. Added for compatibility with super API.
+        :param prompt: Ignored here. Added for compatibility with super API.
         :param batch_size: the batch size used for the computation
         :param show_progress_bar: Ignored here. Added for compatibility with super API.
         :param output_value: Ignored here. Added for compatibility with super API.
+        :param precision: Ignored here. Added for compatibility with super API.
         :param convert_to_numpy: If true, the output is a list of numpy vectors. Else, it is a list
                 of pytorch tensors.
         :param convert_to_tensor: If true, you get one large tensor as return. Overwrites any
@@ -974,8 +1129,11 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
 
         # These args are for API compatability, but are currently ignored in our version of encode()
         _ = (
+            prompt_name,
+            prompt,
             show_progress_bar,
             output_value,
+            precision,
             normalize_embeddings,
         )
 
@@ -1014,11 +1172,38 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
 
         for start_index in range(0, len(list_of_sentences), batch_size):
             sentences_batch = sentences_sorted[start_index : start_index + batch_size]
-            features, token_count = self._truncate_input_tokens(
+            features, token_count, truncation_needed = self._tokenize_plus(
                 truncate_input_tokens,
                 sentences_batch,
                 implicit_truncation_errors=implicit_truncation_errors,
             )
+
+            if truncation_needed:  # truncation was needed and was not done/not allowed
+                if input_was_string:
+                    index_hint = "."
+                else:
+                    # Add index hint for texts where the error was detected.
+                    # Adjust indexes for the start of the batch
+                    truncation_needed = [x + start_index for x in truncation_needed]
+                    # Convert index to pre-sorted index
+                    truncation_needed = [
+                        length_sorted_idx[x] for x in truncation_needed
+                    ]
+                    indexes = f"{', '.join(str(i) for i in truncation_needed)}."
+                    index_hint = (
+                        " for text at "
+                        f"{'index' if len(truncation_needed) == 1 else 'indexes'}: {indexes}"
+                    )
+
+                error.log_raise(
+                    "<NLP08391926E>",
+                    ValueError(
+                        f"Token sequence length (+2 for start/end tokens) exceeds the "
+                        f"maximum sequence length for this model ({self.max_seq_length})"
+                        f"{index_hint}"
+                    ),
+                )
+
             input_token_count += token_count
 
             features = batch_to_device(features, device)
