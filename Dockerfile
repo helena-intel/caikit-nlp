@@ -29,7 +29,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY --from=builder /build/dist/caikit_nlp*.whl /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install /tmp/caikit_nlp*.whl && \
+    pip install torch==2.3.* --index-url https://download.pytorch.org/whl/cpu && pip install /tmp/caikit_nlp*.whl && \
     rm /tmp/caikit_nlp*.whl
 
 COPY LICENSE /opt/caikit/

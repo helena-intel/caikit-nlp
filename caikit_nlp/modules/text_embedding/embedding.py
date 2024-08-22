@@ -100,7 +100,6 @@ except ModuleNotFoundError:
     SentenceTransformer = SentenceTransformerNotAvailable
 
 embedding_cfg = get_config().get("embedding", {})
-
 AUTOCAST = env_val_to_bool(val=embedding_cfg.get("autocast"))
 IPEX = env_val_to_bool(val=embedding_cfg.get("ipex"))
 OPENVINO = env_val_to_bool(val=embedding_cfg.get("openvino"))
@@ -1067,7 +1066,8 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
         return tokenizer(
             texts,
             return_attention_mask=True,  # Used for determining token count
-            return_token_type_ids=False,
+            # self._backend is set by OpenVINO sentence-transformers integration
+            return_token_type_ids=self._backend=="openvino",
             return_overflowing_tokens=False,  # DO NOT USE overflow tokens break sentence batches
             return_offsets_mapping=True,  # Used for truncation
             return_length=False,
