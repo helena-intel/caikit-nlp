@@ -7,32 +7,32 @@ This fork enables an OpenVINO backend for caikit-nlp. It requires a custom versi
 Recommended usage:
 
 1. Install locally: ```pip install .``` in the repository root
-2. Bootstrap model (see main README below) and put it in /path/to/caikitmodels
+2. Bootstrap model and put it in /path/to/caikitmodels:
 ```
 import os
 
 os.environ['ALLOW_DOWNLOADS'] = "1"
 
-import caikit_nlp
 import caikit_nlp.modules.text_embedding.embedding
 
 model_name = "BAAI/bge-large-en-v1.5"
 model = caikit_nlp.modules.text_embedding.embedding.EmbeddingModule.bootstrap(model_name)
 model.save(f"{model_name}-caikit") 
 ```
-3. Build docker image: ```docker build -t caikit-nlp```
-4. Run docker image. In the command below, replace /path/to/caikitmodels with the path to the directory with your bootstrapped models, and /path/to/configs with the path to the configs directory in this repository.
+3. Build docker image: ```docker build -t caikit-nlp .```
+4. Run docker container. In the command below, replace /path/to/caikitmodels with the path to the directory with your bootstrapped models, and /path/to/configs with the path to the configs directory in this repository.
    ```
-run -it --rm -v /path/to/caikitmodels:/mnt/models -v /path/to/configs:/mnt/configs -e RUNTIME_LIBRARY=caikit_nlp  -e RUNTIME_LOCAL_MODELS_DIR=/mnt/models -e HF_HOME=/tmp/hf_home   -e RUNTIME_GRPC_ENABLED=true   -e RUNTIME_HTTP_ENABLED=true -e RUNTIME_HTTP_PORT=8080 -e RUNTIME_GRPC_PORT=8085 -e CONFIG_FILES=/mnt/configs/config.yml -p 8085:8085 caikit-nlp python -m caikit.runtime
+   docker run -it --rm -v /path/to/caikitmodels:/mnt/models -v /path/to/configs:/mnt/configs -e RUNTIME_LIBRARY=caikit_nlp  -e RUNTIME_LOCAL_MODELS_DIR=/mnt/models -e HF_HOME=/tmp/hf_home   -e RUNTIME_GRPC_ENABLED=true   -e RUNTIME_HTTP_ENABLED=true -e RUNTIME_HTTP_PORT=8080 -e RUNTIME_GRPC_PORT=8085 -e CONFIG_FILES=/mnt/configs/config.yml -p 8085:8085 caikit-nlp python -m caikit.runtime
    ```
 5.  In a separate shell, run inference. For example, with grpcurl: ```grpcurl -plaintext -d '{"text": "Led Zeppelin were an English rock band formed in London in 1968."}' -H "mm-model-id: bge-large-en-v1.5-caikit" localhost:8085 caikit.runtime.Nlp.NlpService/EmbeddingTaskPredict```
 
 Notes:
 - To enable/disable OpenVINO set openvino to true/false in configs/config.yml
 - Models are converted to OpenVINO on the fly
+- Currently only Feature Extraction Embedding models are supported.
 
 
-Original Caikit NLP README:
+_Original Caikit NLP README:_
 
 # Caikit NLP
 
