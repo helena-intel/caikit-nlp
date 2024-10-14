@@ -1,0 +1,13 @@
+# config.yml
+runtime:
+  library: caikit_nlp
+  local_models_dir: /mnt/models
+  lazy_load_local_models: true
+
+log:
+  formatter: pretty # optional: log formatter is set to json by default
+
+embedding:
+  openvino: true
+    # optional: add OpenVINO config json file
+    # openvino_config: /mnt/configs/ov_config.json
