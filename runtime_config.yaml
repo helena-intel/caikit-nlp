@@ -58,6 +58,9 @@ embedding:
   ipex: false
   # Use autocast in encode with its default dtype (bfloat16)
   autocast: false
+  # Use OpenVINO backend
+  openvino: false
+  openvino_config: null
   # For testing, set device to "mps" on MacOS or "xpu" for IPEX GPU.
   # Otherwise, the default does automatic checks for cuda GPU (else cpu).
   device: ""

@@ -55,6 +55,9 @@ embedding:
   # For testing, set device to "mps" on MacOS or "xpu" for IPEX GPU.
   # Otherwise, the default does automatic checks for cuda GPU (else cpu).
   device: ""
+  # OpenVINO backend
+  openvino: false
+  openvino_config: null
 
 runtime:
   library: caikit_nlp

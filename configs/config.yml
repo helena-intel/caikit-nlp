@@ -8,6 +8,7 @@ log:
   formatter: pretty # optional: log formatter is set to json by default
 
 embedding:
-  openvino: true
+  openvino:
+    true
     # optional: add OpenVINO config json file
     # openvino_config: /mnt/configs/ov_config.json

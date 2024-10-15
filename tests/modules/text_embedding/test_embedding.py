@@ -1159,10 +1159,11 @@ def test_same_same(loaded_model: EmbeddingModule, truncate_input_tokens):
         separate_vectors[1], separate_vectors[2], rtol=1e-05, atol=1e-08
     )
 
+
 @pytest.mark.skipif(
     importlib.util.find_spec("openvino") is None, reason="OpenVINO is not installed."
 )
-def test_openvino(loaded_model):
+def test_openvino(loaded_model, monkeypatch):
     """
     Test that OpenVINO integration works and returns the same embeddings as PyTorch
     Run `pip install optimum[openvino]` to install dependencies for using OpenVINO)
@@ -1173,26 +1174,26 @@ def test_openvino(loaded_model):
     # Local
     import caikit_nlp.modules.text_embedding.embedding
 
-    openvino = caikit_nlp.modules.text_embedding.embedding.OPENVINO
-    openvino_config = caikit_nlp.modules.text_embedding.embedding.OPENVINO_CONFIG
-    caikit_nlp.modules.text_embedding.embedding.OPENVINO = True
-    caikit_nlp.modules.text_embedding.embedding.OPENVINO_CONFIG = {
-        "INFERENCE_PRECISION_HINT": "f32"
-    }
+    def mock_get_config():
+        return {
+            "runtime": {"library": "caikit_nlp"},
+            "embedding": {
+                "openvino": True,
+                "openvino_config": {"INFERENCE_PRECISION_HINT": "f32"},
+            },
+        }
 
-    try:
-        with tempfile.TemporaryDirectory() as model_dir:
-            ov_model_dir = Path(model_dir) / "ov_model"
-            BOOTSTRAPPED_MODEL.save(str(ov_model_dir))
-            ov_model = caikit_nlp.modules.text_embedding.EmbeddingModule.load(
-                str(ov_model_dir)
-            )
-            assert isinstance(
-                ov_model.model._first_module().auto_model, OVModelForFeatureExtraction
-            )
-    finally:
-        caikit_nlp.modules.text_embedding.embedding.OPENVINO = openvino
-        caikit_nlp.modules.text_embedding.embedding.OPENVINO_CONFIG = openvino_config
+    monkeypatch.setattr(
+        "caikit_nlp.modules.text_embedding.embedding.get_config", mock_get_config
+    )
+
+    with tempfile.TemporaryDirectory() as model_dir:
+        ov_model_dir = Path(model_dir) / "ov_model"
+        BOOTSTRAPPED_MODEL.save(str(ov_model_dir))
+        ov_model = EmbeddingModule.load(str(ov_model_dir))
+        assert isinstance(
+            ov_model.model._first_module().auto_model, OVModelForFeatureExtraction
+        )
 
     pt_embeddings = loaded_model.run_embedding(text="hello world")
     ov_embeddings = ov_model.run_embedding(text="hello world")

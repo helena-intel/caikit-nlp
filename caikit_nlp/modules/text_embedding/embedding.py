@@ -98,6 +98,7 @@ except ModuleNotFoundError:
             importlib.import_module("sentence_transformers")
 
     SentenceTransformer = SentenceTransformerNotAvailable
+
 RT = TypeVar("RT")  # return type
 
 
@@ -201,12 +202,16 @@ class EmbeddingModule(ModuleBase):
         device = cls._select_device(ipex, embedding_cfg.get("device", ""))
         openvino = cls._get_openvino(env_val_to_bool(embedding_cfg.get("openvino")))
         openvino_config = embedding_cfg.get("openvino_config", None)
-        model_kwargs = ( {"ov_config": openvino_config} if (openvino and openvino_config is not None) else None)
+        model_kwargs = (
+            {"ov_config": openvino_config}
+            if (openvino and openvino_config is not None)
+            else None
+        )
 
         model = SentenceTransformerWithTruncate(
             model_name_or_path=artifacts_path,
             device=device,
-            backend="openvino" if openvino else None,
+            backend="openvino" if openvino else "torch",
             model_kwargs=model_kwargs,
             trust_remote_code=trust_remote_code,
         )
@@ -215,7 +220,9 @@ class EmbeddingModule(ModuleBase):
             model.to(torch.device(device))
 
         if not openvino:
-            model = EmbeddingModule._optimize(model, ipex, device, AUTOCAST, PT2_COMPILE)
+            model = EmbeddingModule._optimize(
+                model, ipex, device, autocast, pt2_compile
+            )
         return cls(model)
 
     @property
@@ -949,7 +956,7 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         config_kwargs: Optional[Dict[str, Any]] = None,
         model_card_data: Optional[SentenceTransformerModelCardData] = None,
-        backend: Optional[str] = None
+        backend: Optional[str] = "torch",
     ):
         super().__init__(
             model_name_or_path,
@@ -969,7 +976,7 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
             tokenizer_kwargs,
             config_kwargs,
             model_card_data,
-            backend
+            backend,
         )
         self.tokenizers = {}
 
@@ -1082,7 +1089,7 @@ class SentenceTransformerWithTruncate(SentenceTransformer):
             texts,
             return_attention_mask=True,  # Used for determining token count
             # self.backend is set by sentence-transformers with OpenVINO backend
-            return_token_type_ids=self.backend=="openvino",
+            return_token_type_ids=self.backend == "openvino",
             return_overflowing_tokens=False,  # DO NOT USE overflow tokens break sentence batches
             return_offsets_mapping=True,  # Used for truncation
             return_length=False,
